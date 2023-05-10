@@ -1,0 +1,181 @@
+#!/bin/bash
+
+# Enable strict settings for more sane bash
+set -o errexit    # Exit when an expression fails
+set -o pipefail   # Exit when a command in a pipeline fails
+set -o nounset    # Exit when an undefined variable is used
+set -o noglob     # Disable shell globbing
+set -o noclobber  # Disable automatic file overwriting
+
+# Heroku buildpack compile steps receive 3 arguments:
+# https://devcenter.heroku.com/articles/buildpack-api#bin-compile
+if [ $# -ne 3 ]; then
+    echo "Usage: $PROGNAME <build-dir> <cache-dir> <env-dir>"
+    exit 1
+fi
+
+# https://devcenter.heroku.com/articles/buildpack-api#style
+function topic() {
+  echo "-----> $*"
+}
+
+function subtopic() {
+  echo "----------> $*"
+}
+
+BUILD_DIR="$1"
+CACHE_DIR="$2"
+ENV_DIR="$3"
+
+# Heroku environment variables are stored as one env var per file in the ENV_DIR
+# Ensure the MAGNUS_RAKE_BUILD_TASK env var is set and bail if not
+if [ ! -f "$ENV_DIR/MAGNUS_RAKE_BUILD_TASK" ]; then
+  echo "error: expected MAGNUS_RAKE_BUILD_TASK to be set on environment!"
+  exit 1
+fi
+
+# Read in the configured build task so we can use it later
+RAKE_TASK=$(cat "$ENV_DIR/MAGNUS_RAKE_BUILD_TASK")
+
+# Ensure cache directory exists
+mkdir -p "$CACHE_DIR"
+
+# Setup environment so that we can use Cargo and the binaries it installs
+export CARGO_HOME="$CACHE_DIR/cargo"
+PATH="$CARGO_HOME/bin:$PATH"
+
+topic "Magnus buildpack"
+
+RUST_VERSION=stable
+
+# Silently check if a binary is installed
+binary_is_installed() {
+  local binary_name
+  binary_name="$1"
+
+  if command -v "$binary_name" >/dev/null 2>&1; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Check if rustup is already installed so we can skip download and install in some cases
+is_rustup_already_installed() {
+  # Check if CARGO_HOME is an existing directory and check if `rustup` is on the path
+  if [ -d "$CARGO_HOME" ] && binary_is_installed rustup; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Either update rustup or download and install it
+# This is more or less pulled from emk/heroku-buildpack-rust:
+# https://github.com/emk/heroku-buildpack-rust/blob/cfa0f0621411f0dbb46df9d4740e119b7a459ccc/bin/compile#L103-L121
+install_rustup() {
+  topic "Preparing rustup"
+
+  if is_rustup_already_installed; then
+    subtopic "rustup already installed. Updating and ensuring correct version"
+
+    rustup self update
+    rustup update "$RUST_VERSION"
+    rustup default "$RUST_VERSION"
+  else
+    pushd "$CACHE_DIR" || exit 1
+
+    subtopic "Downloading rustup"
+    curl https://sh.rustup.rs -sSf > rustup.sh
+    chmod u+x rustup.sh
+
+    subtopic "Using rustup to install Rust channel $RUST_VERSION"
+    ./rustup.sh -y --default-toolchain "$RUST_VERSION"
+    rm rustup.sh
+
+    popd || exit 1
+  fi
+}
+
+# Run a Cargo build assuming that there is a Cargo.toml file in the root of the build directory
+# This task is installing all of the Rust binaries and dependencies so that we can then later
+# actually compile our Ruby native extensions
+cargo_build() {
+  topic "Running cargo build"
+
+  pushd "$BUILD_DIR" || exit 1
+
+  cargo build --release
+
+  popd || exit 1
+}
+
+# Now that all of our Rust dependencies are installed, we can actually run the Rake task
+# that builds our Ruby native extensions.
+#
+# NOTE: the Heroku env var that specifies the rake task could be multiple tasks, separated by spaces,
+# (e.g. "compile:my_gem clean").
+rake_build() {
+  topic "Running rake $RAKE_TASK"
+
+  pushd "$BUILD_DIR" || exit 1
+
+  # The RAKE_TASK might be multiple tasks split by spaces so
+  # we run this command with intention of re-splitting
+  # shellcheck disable=SC2086
+  bundle exec rake $RAKE_TASK
+
+  popd || exit 1
+}
+
+# The Cargo build process creates a bunch of binary artifacts in the `./target` dir of the app.
+# Once we have done the final rake compilation of our native extensions, we can remove these
+# so that they don't inflate the slug size.
+#
+# Based on some hand experimentation, deleting this directory after compilation shaved off ~70MB
+# from the final slug size (for a fairly small native extension).
+cleanup_build_target() {
+  topic "Cleaning up intermediate cargo build artifacts"
+
+  pushd "$BUILD_DIR" || exit 1
+  # Assert that $BUILD_DIR/target exists
+  if [ ! -d target ]; then
+    echo "$BUILD_DIR/target does not exist?"
+    ls -la "$BUILD_DIR"
+    exit 1
+  fi
+
+  rm -rf ./target
+
+  popd || exit 1
+}
+
+# This buildpack assumes that heroku-buildpack-apt runs before it. That buildpack installs apt packages
+# to $BUILD_DIR/.apt which by default will be included in our final slug. We don't need any of these
+# binaries at runtime now that our native extension is compiled, so we can remove it.
+#
+# Based on some hand experimentation, this dropped the final slug size by ~160MB.
+cleanup_apt_artifacts() {
+  topic "Removing .apt artifacts to minimize slug size"
+
+  pushd "$BUILD_DIR" || exit 1
+
+  # Assert that $BUILD_DIR/.apt exists
+  if [ ! -d .apt ]; then
+    echo "$BUILD_DIR/.apt does not exist?"
+    ls -la "$BUILD_DIR"
+    exit 1
+  fi
+
+  rm -rf ./.apt
+
+  popd || exit 1
+}
+
+install_rustup
+cargo_build
+rake_build
+cleanup_build_target
+cleanup_apt_artifacts
+
+topic "Magnus done!"

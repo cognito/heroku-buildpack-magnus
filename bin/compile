@@ -4,7 +4,6 @@
 set -o errexit    # Exit when an expression fails
 set -o pipefail   # Exit when a command in a pipeline fails
 set -o nounset    # Exit when an undefined variable is used
-set -o noglob     # Disable shell globbing
 set -o noclobber  # Disable automatic file overwriting
 
 # Heroku buildpack compile steps receive 3 arguments:
@@ -154,9 +153,10 @@ cleanup_build_target() {
 # to $BUILD_DIR/.apt which by default will be included in our final slug. We don't need any of these
 # binaries at runtime now that our native extension is compiled, so we can remove it.
 #
-# Based on some hand experimentation, this dropped the final slug size by ~160MB.
+# Due to some conflicts with the code consuming this, we can't wipe the entire directory, so we just
+# remove the llvm libraries which cuts about 100MB of the bloat, leaving ~60MB behind.
 cleanup_apt_artifacts() {
-  topic "Removing .apt artifacts to minimize slug size"
+  topic "Removing .apt llvm artifacts to minimize slug size"
 
   pushd "$BUILD_DIR" || exit 1
 
@@ -167,7 +167,7 @@ cleanup_apt_artifacts() {
     exit 1
   fi
 
-  rm -rf ./.apt
+  rm -rf ./.apt/usr/lib/llvm*
 
   popd || exit 1
 }
